@@ -5,6 +5,7 @@ from rest_framework import viewsets, status
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.authtoken.models import Token
+from rest_framework.permissions import IsAuthenticated
 
 from .models import User
 from .serializers import UserSerializer
@@ -27,15 +28,15 @@ def forbidden(detail: str, field: str = "user_pk"):
 class UserViewSet(viewsets.ModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
+    permission_classes = [IsAuthenticated]  # ✅ 유저 API는 인증 필수
 
-    # ✅ 카카오 로그인 콜백 (인가 코드 → access_token → 유저 인증)
-    @action(detail=False, methods=["get"], url_path="auth/kakao/callback")
+    # ✅ 카카오 로그인 콜백
+    @action(detail=False, methods=["get"], url_path="auth/kakao/callback", permission_classes=[])
     def kakao_callback(self, request):
         code = request.query_params.get("code")
         if not code:
             return bad_request("인가 코드(code)가 필요합니다", "code")
 
-        # 1️⃣ 토큰 교환
         token_url = "https://kauth.kakao.com/oauth/token"
         data = {
             "grant_type": "authorization_code",
@@ -56,8 +57,6 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        print("KAKAO TOKEN RESP:", resp_json)
-
         if token_resp.status_code != 200:
             return Response(
                 {
@@ -71,13 +70,8 @@ class UserViewSet(viewsets.ModelViewSet):
 
         kakao_access_token = resp_json.get("access_token")
         if not kakao_access_token:
-            return bad_request(
-                "access_token 발급 실패",
-                "kakao_access_token",
-                extra=resp_json,
-            )
+            return bad_request("access_token 발급 실패", "kakao_access_token", extra=resp_json)
 
-        # 2️⃣ 유저 정보 조회
         try:
             headers = {"Authorization": f"Bearer {kakao_access_token}"}
             resp = requests.get("https://kapi.kakao.com/v2/user/me", headers=headers, timeout=5)
@@ -88,63 +82,35 @@ class UserViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_502_BAD_GATEWAY,
             )
 
-        print("KAKAO USER INFO:", user_info)
-
         if resp.status_code != 200:
-            return bad_request(
-                "카카오 사용자 정보 조회 실패",
-                "kakao_access_token",
-                extra=user_info,
-            )
+            return bad_request("카카오 사용자 정보 조회 실패", "kakao_access_token", extra=user_info)
 
         kakao_id = user_info.get("id")
         kakao_account = user_info.get("kakao_account", {})
         email = kakao_account.get("email") or f"{kakao_id}@kakao-user.com"
 
         if not kakao_id:
-            return bad_request(
-                "카카오 사용자 ID를 가져올 수 없습니다",
-                "kakao_id",
-                extra=user_info,
-            )
+            return bad_request("카카오 사용자 ID를 가져올 수 없습니다", "kakao_id", extra=user_info)
 
-        # 3️⃣ 유저 생성/조회
         try:
             user, _ = User.objects.get_or_create(
                 kakao_id=str(kakao_id),
                 defaults={"role": None, "is_active": True, "is_staff": False},
             )
         except Exception as e:
-            return Response(
-                {"detail": "유저 생성 실패", "error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return Response({"detail": "유저 생성 실패", "error": str(e)}, status=500)
 
-        # 4️⃣ 장고 토큰 발급
         try:
             token, _ = Token.objects.get_or_create(user=user)
         except Exception as e:
-            return Response(
-                {"detail": "토큰 발급 실패", "error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return Response({"detail": "토큰 발급 실패", "error": str(e)}, status=500)
 
-        # 5️⃣ 직렬화
         try:
             user_data = UserSerializer(user).data
         except Exception as e:
-            return Response(
-                {"detail": "유저 직렬화 실패", "error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+            return Response({"detail": "유저 직렬화 실패", "error": str(e)}, status=500)
 
-        return Response(
-            {
-                "accessToken": token.key,
-                "user": user_data,
-            },
-            status=status.HTTP_200_OK,
-        )
+        return Response({"accessToken": token.key, "user": user_data}, status=200)
 
     # ✅ 로그아웃
     @action(detail=False, methods=["post"], url_path="auth/kakao/logout")
@@ -153,13 +119,10 @@ class UserViewSet(viewsets.ModelViewSet):
             Token.objects.filter(user=request.user).delete()
         return Response({"message": "Logged out successfully."}, status=200)
 
-    # ✅ 유저 role 설정 (artist / space)
-    @action(detail=True, methods=["post"], url_path="type")
-    def set_role(self, request, pk=None):
-    
-        user = self.get_object()
-        if request.user != user:
-            return forbidden("본인만 role을 변경할 수 있습니다", "user_pk")
+    # ✅ 본인 role 설정 (id 제거, 토큰으로 식별)
+    @action(detail=False, methods=["post"], url_path="me/type", permission_classes=[IsAuthenticated])
+    def set_role_self(self, request):
+        user = request.user
         role = request.data.get("role")
 
         if role not in ["artist", "space"]:
@@ -175,3 +138,10 @@ class UserViewSet(viewsets.ModelViewSet):
             "phone_number": user.phone_number,
             "created_at": user.created_at,
         })
+
+    # ✅ 전체 유저 조회 (관리용)
+    @action(detail=False, methods=["get"], url_path="all", permission_classes=[IsAuthenticated])
+    def list_all_users(self, request):
+        users = User.objects.all().order_by("-created_at")
+        data = UserSerializer(users, many=True).data
+        return Response(data)
